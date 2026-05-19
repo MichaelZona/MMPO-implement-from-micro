@@ -1,34 +1,3 @@
-"""
-Standalone validation script for Algorithm 1 (Gradient-based Estimation for
-Ranking Model Probability) from the MMPO paper.
-
-Setting: a = 1 anchor per ranking instance. The anchor is the TOP-RANKED
-response (index 0 after sorting by ground-truth score, descending). This
-matches Algorithm 1's "top a ranked responses as anchors" with a = 1.
-
-Reward definition (length-normalized):
-    r_j = (1 / L_resp_j) * sum_{t in response} log pi_base(y_t | x, y_<t)
-i.e. the negative cross-entropy of the response tokens.
-Equivalently:
-    CE_j = -r_j
-where CE_j is the mean per-token cross-entropy over response tokens.
-
-For each prompt with m candidate responses:
-  1. Anchor = candidate 0. Run forward + backward:
-       r_anchor:  scalar
-       h_anchor:  [L_a, D]   full inputs_embeds
-       g_anchor:  [L_a, D]   d r_anchor / d h_anchor (full tensor)
-  2. For each non-anchor j: forward only, get exact r_j and h_j.
-  3. Taylor estimate (sequence-level inner product):
-       hat_r_j = r_anchor + <g_anchor, h_j - h_anchor>
-     (h_j is zero-padded to match L_a; positions beyond L_a in either
-      direction contribute via the natural extension explained inline.)
-  4. Report two metrics over non-anchor candidates:
-     - Relative MSE on rewards:        rel_MSE(r)  = mean (hat_r - r)^2 / mean r^2
-     - Relative MSE on CE losses:      rel_MSE(CE) = mean (hat_CE - CE)^2 / mean CE^2
-       where hat_CE_j = -hat_r_j and CE_j = -r_j.
-"""
-
 from collections import defaultdict
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple

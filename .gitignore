@@ -1,7 +1,7 @@
 __pycache__
 *.pyc
 
-logs/
+log/
 wandb/
 output_models/
 data_process/dataset/

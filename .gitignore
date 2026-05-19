@@ -1,0 +1,11 @@
+__pycache__
+*.pyc
+
+logs/
+wandb/
+output_models/
+data_process/dataset/
+
+cmd_results/
+
+data_process/.hf_datasets_cache/

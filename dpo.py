@@ -95,7 +95,12 @@ class ScriptArguments:
     wandb_name: str = field(default="standard_dpo")
     log_dir: str = field(default="./output_models")
     data_path: str = field(default="cyclic_ultrafeedback_all_pairs")
+    # Comma-separated attribute names to keep. "" or "all" = no filtering.
+    # Accepts raw names ("helpfulness") or canonical ("ultrafeedback-helpfulness").
+    attribute: str = field(default="")
     downsample_rate: float = field(default=1.0)
+    # If < 0, eval downsample follows downsample_rate; otherwise applied separately.
+    eval_downsample_rate: float = field(default=-1.0)
     eval_only: bool = field(default=False)
     manual_seed: int = field(default=0)
     eval_strategy: str = field(default="steps")
@@ -105,13 +110,57 @@ class ScriptArguments:
     logging_steps: int = field(default=10)
     beta: float = field(default=0.1)
     use_wandb: bool = field(default=True)
+    # ---- Taylor anchor approximation ----
+    use_taylor_approx: bool = field(default=False)
+    # Strategy for picking the anchor side per example: "random" | "chosen" | "rejected"
+    taylor_anchor_strategy: str = field(default="random")
 
 
 # ---------------------------------------------------------------------------
 # Data
 # ---------------------------------------------------------------------------
-def load_cyclic_ultrafeedback_pairwise_split(split: str) -> Dataset:
-    """Expand a (responses, scores, preference_dimension) group into all strict pairs."""
+def _expand_attribute(name: str) -> set:
+    """Map a user input like 'helpfulness' to all canonical aliases it could match.
+
+    Different datasets canonicalize differently (e.g. cyclic_ultrafeedback maps
+    'helpfulness' -> 'ultrafeedback-helpfulness', while per_attribute_pairwise
+    keeps 'helpfulness' as is). Expanding lets one CLI value match both.
+    """
+    name = name.strip()
+    out = {name}
+    if name in ATTRIBUTE_ALIASES:
+        out.add(ATTRIBUTE_ALIASES[name])
+    if name in CYCLIC_ULTRAFEEDBACK_ATTRIBUTE_ALIASES:
+        out.add(CYCLIC_ULTRAFEEDBACK_ATTRIBUTE_ALIASES[name])
+    return out
+
+
+def parse_attribute_filter(arg: str) -> Optional[set]:
+    """Parse comma-separated attribute names. Returns canonical match set, or None for 'all'."""
+    if not arg or arg.lower() in {"all", "none"}:
+        return None
+    names = [n for n in (n.strip() for n in arg.split(",")) if n]
+    allowed: set = set()
+    for name in names:
+        expanded = _expand_attribute(name)
+        # Verify at least one expansion is a known canonical attribute.
+        if not any(c in ATTRIBUTE_NAME_TO_ID for c in expanded):
+            raise ValueError(
+                f"Unknown attribute '{name}'. Known canonical names: "
+                f"{sorted(ATTRIBUTE_NAME_TO_ID.keys())}"
+            )
+        allowed |= expanded
+    return allowed
+
+
+def load_cyclic_ultrafeedback_pairwise_split(
+    split: str, allowed_attrs: Optional[set] = None
+) -> Dataset:
+    """Expand a (responses, scores, preference_dimension) group into all strict pairs.
+
+    If allowed_attrs is given, rows whose (canonical) attribute is not in the set
+    are skipped during construction (no wasted pair expansion).
+    """
     dataset_dir = Path("data_process/dataset/cyclic_ultrafeedback_all_pairs") / split
     rows: List[Dict[str, Any]] = []
     for shard_path in sorted(dataset_dir.glob("data-*.arrow")):
@@ -124,6 +173,8 @@ def load_cyclic_ultrafeedback_pairwise_split(split: str) -> Dataset:
                     attribute = CYCLIC_ULTRAFEEDBACK_ATTRIBUTE_ALIASES.get(
                         example["preference_dimension"], example["preference_dimension"]
                     )
+                    if allowed_attrs is not None and attribute not in allowed_attrs:
+                        continue
                     n = len(responses)
                     for i in range(n - 1):
                         for j in range(i + 1, n):
@@ -142,7 +193,10 @@ def load_cyclic_ultrafeedback_pairwise_split(split: str) -> Dataset:
                                 }
                             )
     if not rows:
-        raise ValueError(f"No pairwise rows built from {dataset_dir}")
+        raise ValueError(
+            f"No pairwise rows built from {dataset_dir}"
+            + (f" (after attribute filter {allowed_attrs})" if allowed_attrs else "")
+        )
     return Dataset.from_list(rows)
 
 
@@ -202,20 +256,35 @@ def build_dataset_pairwise(ds: Dataset, tokenizer: AutoTokenizer, max_length: in
     return ds
 
 
-def load_all_datasets(data_path_arg: str, tokenizer: AutoTokenizer, max_length: int, seed: int):
+def load_all_datasets(
+    data_path_arg: str,
+    tokenizer: AutoTokenizer,
+    max_length: int,
+    seed: int,
+    allowed_attrs: Optional[set] = None,
+):
     train_parts, eval_parts = [], []
     for data_path in data_path_arg.split("-"):
         if "ultrafeedback_per_attribute_pairwise" in data_path:
             ds = load_from_disk("data_process/dataset/ultrafeedback_per_attribute_pairwise")["train"]
+            if allowed_attrs is not None:
+                ds = ds.filter(
+                    lambda x, allowed=allowed_attrs: str(x.get("attribute", "")).strip() in allowed,
+                    num_proc=4,
+                )
+                if len(ds) == 0:
+                    raise ValueError(
+                        f"No per_attribute_pairwise rows left after attribute filter {allowed_attrs}"
+                    )
             ds = build_dataset_pairwise(ds, tokenizer, max_length)
             sp = ds.train_test_split(test_size=0.01, seed=seed)
             train_ds, eval_ds = sp["train"], sp["test"]
         elif "cyclic_ultrafeedback_all_pairs" in data_path:
-            train_ds = load_cyclic_ultrafeedback_pairwise_split("train")
+            train_ds = load_cyclic_ultrafeedback_pairwise_split("train", allowed_attrs=allowed_attrs)
             try:
-                eval_ds = load_cyclic_ultrafeedback_pairwise_split("validation")
+                eval_ds = load_cyclic_ultrafeedback_pairwise_split("validation", allowed_attrs=allowed_attrs)
             except (FileNotFoundError, ValueError):
-                eval_ds = load_cyclic_ultrafeedback_pairwise_split("test")
+                eval_ds = load_cyclic_ultrafeedback_pairwise_split("test", allowed_attrs=allowed_attrs)
             train_ds = build_dataset_pairwise(train_ds, tokenizer, max_length)
             eval_ds = build_dataset_pairwise(eval_ds, tokenizer, max_length)
         else:
@@ -237,22 +306,43 @@ class PairwiseDPOCollator:
     return_tensors: str = "pt"
 
     def __call__(self, features: List[Dict[str, Any]]) -> Dict[str, Any]:
+        padding_side = getattr(self.tokenizer, "padding_side", "right")
+
         def pad(side: str):
+            # tokenizer.pad only pads input_ids / attention_mask, NOT labels.
+            # Pad input_ids + attention_mask first, then pad labels manually with -100.
             batch = [
                 {
                     "input_ids": f[f"input_ids_{side}"],
                     "attention_mask": f[f"attention_mask_{side}"],
-                    "labels": f[f"label_{side}"],
                 }
                 for f in features
             ]
-            return self.tokenizer.pad(
+            padded = self.tokenizer.pad(
                 batch,
                 padding=self.padding,
                 max_length=self.max_length,
                 pad_to_multiple_of=self.pad_to_multiple_of,
                 return_tensors=self.return_tensors,
             )
+            target_len = padded["input_ids"].shape[1]
+            labels_rows = []
+            for f in features:
+                lbl = f[f"label_{side}"]
+                if isinstance(lbl, torch.Tensor):
+                    lbl = lbl.tolist()
+                pad_len = target_len - len(lbl)
+                if pad_len > 0:
+                    if padding_side == "right":
+                        lbl = lbl + [-100] * pad_len
+                    else:
+                        lbl = [-100] * pad_len + lbl
+                elif pad_len < 0:
+                    # input_ids was truncated to target_len by tokenizer.pad; match it
+                    lbl = lbl[:target_len] if padding_side == "right" else lbl[-target_len:]
+                labels_rows.append(lbl)
+            padded["labels"] = torch.tensor(labels_rows, dtype=torch.long)
+            return padded
 
         c = pad("chosen")
         r = pad("rejected")
@@ -297,10 +387,23 @@ def compute_metrics(eval_pred):
 # Trainer
 # ---------------------------------------------------------------------------
 class StandardDPOTrainer(Trainer):
+    """Manual DPO. Override compute_loss to tweak the objective."""
 
-    def __init__(self, *args, beta: float = 0.1, ref_model: Optional[PreTrainedModel] = None, **kwargs):
+    def __init__(
+        self,
+        *args,
+        beta: float = 0.1,
+        ref_model: Optional[PreTrainedModel] = None,
+        use_taylor_approx: bool = False,
+        taylor_anchor_strategy: str = "random",
+        **kwargs,
+    ):
         super().__init__(*args, **kwargs)
         self.beta = beta
+        self.use_taylor_approx = use_taylor_approx
+        if taylor_anchor_strategy not in {"random", "chosen", "rejected"}:
+            raise ValueError(f"unknown taylor_anchor_strategy: {taylor_anchor_strategy}")
+        self.taylor_anchor_strategy = taylor_anchor_strategy
         # accelerator.prepare_model handles DDP / DeepSpeed placement correctly.
         if ref_model is not None:
             ref_model.eval()
@@ -312,33 +415,173 @@ class StandardDPOTrainer(Trainer):
 
     @staticmethod
     def _sequence_logps(logits: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
-        """Sum of log p(token) over non-masked positions, fp32 for stability."""
-        shift_logits = logits[:, :-1, :].float()
-        shift_labels = labels[:, 1:]
-        valid = (shift_labels != -100).to(dtype=shift_logits.dtype)
-        gather_labels = shift_labels.masked_fill(shift_labels == -100, 0)
-        token_logp = torch.log_softmax(shift_logits, dim=-1).gather(-1, gather_labels.unsqueeze(-1)).squeeze(-1)
-        return (token_logp * valid).sum(dim=1)
+        """Sum of log p(token) over non-masked positions.
+
+        Uses F.cross_entropy(reduction='none', ignore_index=-100) so the
+        [B, L, V] log_softmax tensor is NEVER materialized — the fused kernel
+        computes per-token log p directly. Critical for big vocab (Qwen3=151k).
+        """
+        shift_logits = logits[:, :-1, :].contiguous()
+        shift_labels = labels[:, 1:].contiguous()
+        B, L, V = shift_logits.shape
+        # cross_entropy returns -log p(target); 0 at ignored positions.
+        nll = F.cross_entropy(
+            shift_logits.view(-1, V),
+            shift_labels.view(-1),
+            reduction="none",
+            ignore_index=-100,
+        ).view(B, L)
+        return -nll.sum(dim=1)
+
+    @staticmethod
+    def _pad_right(x: torch.Tensor, target_len: int, value) -> torch.Tensor:
+        cur = x.shape[1]
+        if cur >= target_len:
+            return x
+        return F.pad(x, (0, target_len - cur), value=value)
+
+    def _pick_anchor_mask(self, batch_size: int, device: torch.device) -> torch.Tensor:
+        """Return boolean mask [B]: True means CHOSEN is the anchor, False means REJECTED is."""
+        if self.taylor_anchor_strategy == "chosen":
+            return torch.ones(batch_size, dtype=torch.bool, device=device)
+        if self.taylor_anchor_strategy == "rejected":
+            return torch.zeros(batch_size, dtype=torch.bool, device=device)
+        # random per example
+        return torch.rand(batch_size, device=device) < 0.5
+
+    def _taylor_logp_pair(
+        self,
+        model: torch.nn.Module,
+        c_ids: torch.Tensor, c_attn: torch.Tensor, c_lbl: torch.Tensor,
+        r_ids: torch.Tensor, r_attn: torch.Tensor, r_lbl: torch.Tensor,
+        anchor_is_chosen: torch.Tensor,
+        is_ref: bool,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """DeepSpeed-safe Taylor approximation.
+
+        Two-stage forward:
+          (1) freeze model params, forward + autograd.grad to get g_anchor.
+              Freezing prevents DeepSpeed's post-backward hook from trying to
+              reduce non-existent param gradients (the original bug).
+          (2) for policy: a SECOND forward with params unfrozen, to get a
+              logp_anchor whose gradient flows back to optimizer params.
+              For ref: skip (logp_eval from step 1 is fine).
+
+        Net cost: 2 forwards on policy anchor + 1 forward on ref anchor
+        + 0 forwards on either non-anchor side = 3 forwards (baseline = 4).
+
+        Approximation: r_hat(non) = r(anchor) + <g_anchor, h_non - h_anchor>,
+        g_anchor detached (no Hessian / no double backward).
+        """
+        B = c_ids.shape[0]
+        pad_id = self.processing_class.pad_token_id
+        if pad_id is None:
+            pad_id = 0
+
+        L_max = max(c_ids.shape[1], r_ids.shape[1])
+        c_ids_p = self._pad_right(c_ids, L_max, pad_id)
+        r_ids_p = self._pad_right(r_ids, L_max, pad_id)
+        c_attn_p = self._pad_right(c_attn, L_max, 0)
+        r_attn_p = self._pad_right(r_attn, L_max, 0)
+        c_lbl_p = self._pad_right(c_lbl, L_max, -100)
+        r_lbl_p = self._pad_right(r_lbl, L_max, -100)
+
+        m = anchor_is_chosen.view(B, 1)
+        anchor_ids = torch.where(m, c_ids_p, r_ids_p)
+        anchor_attn = torch.where(m, c_attn_p, r_attn_p)
+        anchor_lbl = torch.where(m, c_lbl_p, r_lbl_p)
+        non_ids = torch.where(m, r_ids_p, c_ids_p)
+        non_attn = torch.where(m, r_attn_p, c_attn_p)
+
+        # Use the underlying unwrapped module for the frozen forward so the
+        # DeepSpeed engine's hooks aren't triggered.
+        underlying = model.module if hasattr(model, "module") else model
+        embed = underlying.get_input_embeddings()
+
+        # ---------- Step 1: g_anchor via frozen-param forward ----------
+        params = list(model.parameters())
+        saved_req = [p.requires_grad for p in params]
+        for p in params:
+            p.requires_grad_(False)
+        try:
+            with torch.enable_grad():
+                h_for_grad = embed(anchor_ids).detach().requires_grad_(True)
+                out_eval = underlying(
+                    inputs_embeds=h_for_grad,
+                    attention_mask=anchor_attn,
+                    use_cache=False,
+                )
+                logp_eval = self._sequence_logps(out_eval.logits, anchor_lbl)  # [B]
+                (g_anchor,) = torch.autograd.grad(logp_eval.sum(), h_for_grad)
+                g_anchor = g_anchor.detach()
+            logp_eval_value = logp_eval.detach()
+        finally:
+            for p, s in zip(params, saved_req):
+                p.requires_grad_(s)
+
+        # Free step-1 activations before step-2 forward.
+        del out_eval, logp_eval, h_for_grad
+
+        # Mask g at padded anchor positions
+        g_anchor = g_anchor * anchor_attn.unsqueeze(-1).to(g_anchor.dtype)
+
+        # ---------- Step 2: loss-differentiable logp_anchor ----------
+        if is_ref:
+            logp_anchor = logp_eval_value
+        else:
+            out_train = model(
+                input_ids=anchor_ids,
+                attention_mask=anchor_attn,
+                use_cache=False,
+            )
+            logp_anchor = self._sequence_logps(out_train.logits, anchor_lbl)
+
+        # ---------- Step 3: Taylor correction ----------
+        h_anchor_const = embed(anchor_ids).detach()
+        h_non = embed(non_ids)
+        delta = h_non - h_anchor_const
+        delta = delta * non_attn.unsqueeze(-1).to(delta.dtype)
+        correction = (g_anchor * delta).sum(dim=(1, 2))  # [B]
+
+        if is_ref:
+            correction = correction.detach()
+        logp_non = logp_anchor + correction
+
+        logp_c = torch.where(anchor_is_chosen, logp_anchor, logp_non)
+        logp_r = torch.where(anchor_is_chosen, logp_non, logp_anchor)
+        return logp_c, logp_r
 
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
         del num_items_in_batch
         c_ids, c_attn, c_lbl = inputs["input_ids_chosen"], inputs["attention_mask_chosen"], inputs["labels_chosen"]
         r_ids, r_attn, r_lbl = inputs["input_ids_rejected"], inputs["attention_mask_rejected"], inputs["labels_rejected"]
 
-        policy_logp_c = self._sequence_logps(
-            model(input_ids=c_ids, attention_mask=c_attn, use_cache=False).logits, c_lbl
-        )
-        policy_logp_r = self._sequence_logps(
-            model(input_ids=r_ids, attention_mask=r_attn, use_cache=False).logits, r_lbl
-        )
+        if self.use_taylor_approx:
+            anchor_is_chosen = self._pick_anchor_mask(c_ids.shape[0], c_ids.device)
 
-        with torch.no_grad():
-            ref_logp_c = self._sequence_logps(
-                self.ref_model(input_ids=c_ids, attention_mask=c_attn, use_cache=False).logits, c_lbl
+            policy_logp_c, policy_logp_r = self._taylor_logp_pair(
+                model, c_ids, c_attn, c_lbl, r_ids, r_attn, r_lbl,
+                anchor_is_chosen=anchor_is_chosen, is_ref=False,
             )
-            ref_logp_r = self._sequence_logps(
-                self.ref_model(input_ids=r_ids, attention_mask=r_attn, use_cache=False).logits, r_lbl
+            with torch.no_grad():
+                ref_logp_c, ref_logp_r = self._taylor_logp_pair(
+                    self.ref_model, c_ids, c_attn, c_lbl, r_ids, r_attn, r_lbl,
+                    anchor_is_chosen=anchor_is_chosen, is_ref=True,
+                )
+        else:
+            policy_logp_c = self._sequence_logps(
+                model(input_ids=c_ids, attention_mask=c_attn, use_cache=False).logits, c_lbl
             )
+            policy_logp_r = self._sequence_logps(
+                model(input_ids=r_ids, attention_mask=r_attn, use_cache=False).logits, r_lbl
+            )
+            with torch.no_grad():
+                ref_logp_c = self._sequence_logps(
+                    self.ref_model(input_ids=c_ids, attention_mask=c_attn, use_cache=False).logits, c_lbl
+                )
+                ref_logp_r = self._sequence_logps(
+                    self.ref_model(input_ids=r_ids, attention_mask=r_attn, use_cache=False).logits, r_lbl
+                )
 
         chosen_reward = self.beta * (policy_logp_c - ref_logp_c)
         rejected_reward = self.beta * (policy_logp_r - ref_logp_r)
@@ -396,13 +639,23 @@ def main():
 
     if not (0.0 < args.downsample_rate <= 1.0):
         raise ValueError("`downsample_rate` must be in (0, 1].")
+    if args.eval_downsample_rate >= 0 and not (0.0 < args.eval_downsample_rate <= 1.0):
+        raise ValueError("`eval_downsample_rate` must be in (0, 1] (or < 0 to follow train).")
     if args.beta <= 0:
         raise ValueError("`beta` must be > 0.")
+
+    # Resolve eval downsample: < 0 means "follow train"
+    eval_rate = args.eval_downsample_rate if args.eval_downsample_rate >= 0 else args.downsample_rate
+
+    # Parse attribute filter (comma-separated, "" / "all" = no filter)
+    allowed_attrs = parse_attribute_filter(args.attribute)
 
     if accelerator.is_main_process:
         print("=== Arguments ===")
         for k, v in vars(args).items():
             print(f"  {k:<32} {v}")
+        print(f"  (resolved eval_downsample_rate) {eval_rate}")
+        print(f"  (resolved allowed_attrs)        {allowed_attrs if allowed_attrs else 'ALL'}")
         if args.use_wandb:
             wandb.init(project="MultiRewardLearning", name=args.wandb_name, config=vars(args))
 
@@ -415,23 +668,29 @@ def main():
         tokenizer.pad_token = tokenizer.eos_token
 
     # ---- Data ----
-    train_dataset, eval_dataset = load_all_datasets(args.data_path, tokenizer, args.max_length, args.manual_seed)
+    train_dataset, eval_dataset = load_all_datasets(
+        args.data_path, tokenizer, args.max_length, args.manual_seed,
+        allowed_attrs=allowed_attrs,
+    )
     if args.downsample_rate < 1.0:
         keep = max(1, int(len(train_dataset) * args.downsample_rate))
         train_dataset = train_dataset.shuffle(seed=args.manual_seed).select(range(keep))
+    if eval_rate < 1.0:
+        keep = max(1, int(len(eval_dataset) * eval_rate))
+        eval_dataset = eval_dataset.shuffle(seed=args.manual_seed).select(range(keep))
     if accelerator.is_main_process:
         print(f"train rows: {len(train_dataset)} | eval rows: {len(eval_dataset)}")
 
     # ---- Models ----
     policy_model = AutoModelForCausalLM.from_pretrained(
-        args.base_model, torch_dtype=torch.bfloat16, attn_implementation="sdpa"
+        args.base_model, dtype=torch.bfloat16, attn_implementation="sdpa"
     )
     policy_model.resize_token_embeddings(len(tokenizer))
     policy_model.config.pad_token_id = tokenizer.pad_token_id
     policy_model.config.use_cache = False
 
     reference_model = AutoModelForCausalLM.from_pretrained(
-        args.base_model, torch_dtype=torch.bfloat16, attn_implementation="sdpa"
+        args.base_model, dtype=torch.bfloat16, attn_implementation="sdpa"
     )
     reference_model.resize_token_embeddings(len(tokenizer))
     reference_model.config.pad_token_id = tokenizer.pad_token_id
@@ -473,6 +732,8 @@ def main():
         model=policy_model,
         ref_model=reference_model,
         beta=args.beta,
+        use_taylor_approx=args.use_taylor_approx,
+        taylor_anchor_strategy=args.taylor_anchor_strategy,
         args=training_args,
         processing_class=tokenizer,
         train_dataset=train_dataset,

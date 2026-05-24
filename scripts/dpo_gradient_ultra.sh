@@ -1,16 +1,16 @@
 #!/bin/bash
 # ---------------------------------------------------------------------------
-# DPO training with QLoRA (Qwen3-0.6B)
+# DPO training with QLoRA + Taylor gradient approximation (Qwen3-0.6B)
 # ---------------------------------------------------------------------------
-lr=5e-6                         # LoRA-DPO range: 5e-6 ~ 2e-5
-beta=0.01                       # DPO temperature; 0.01 works well with LoRA
-bs=2                            # per_device batch
-gradient_accumulation_steps=4   # effective batch = bs * grad_accum = 8
+lr=5e-6
+beta=0.01
+bs=2
+gradient_accumulation_steps=4   # effective batch = 8
 max_length=1024
 
-data_path="ultrafeedback_per_attribute_pairwise"
-attribute="helpfulness"                    # "" = all attributes; or e.g. "helpfulness"
-downsample_rate=0.05             # 1.0 = full dataset
+data_path="cyclic_ultrafeedback_all_pairs"
+attribute=""
+downsample_rate=1.0
 num_train_epochs=1
 
 # LoRA / QLoRA
@@ -25,7 +25,7 @@ mkdir -p log
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
 for seed in 42; do
-    run_name=dpo_qlora_${data_path}_ds${downsample_rate}_beta${beta}_lr${lr}_ep${num_train_epochs}_seed${seed}
+    run_name=dpo_gradient_qlora_${data_path}_ds${downsample_rate}_beta${beta}_lr${lr}_ep${num_train_epochs}_seed${seed}
 
     CUDA_VISIBLE_DEVICES=0 accelerate launch \
         --config_file configs/config.yaml \
@@ -50,5 +50,7 @@ for seed in 42; do
             --lora_r=$lora_r \
             --lora_alpha=$lora_alpha \
             --lora_dropout=$lora_dropout \
+            --use_taylor_approx=True \
+            --taylor_anchor_strategy=random \
         | tee -a log/${run_name}.log
 done

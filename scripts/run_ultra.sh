@@ -46,4 +46,3 @@ for seed in 42 44 46 ; do
         | tee -a log/${loss_type}_${data_path}_heads${num_heads}_lr${lr}_${loss_components}_seed${seed}.log # 2>&1
 
 done
-
